@@ -1,0 +1,8 @@
+# conduct runtime data (created at run time; never committed)
+worktrees/
+logs/
+state/
+
+# OS / editor cruft
+.DS_Store
+*.swp

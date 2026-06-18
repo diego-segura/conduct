@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+#
+# conduct — a terminal-native clone of Conductor (https://www.conductor.build).
+#
+# Spin up an isolated git worktree per task (named after a city), start its dev
+# server in the background on its own port, and drop into Claude Code / Codex.
+# Run many side-by-side without collisions.
+#
+#   conduct                 start a new worktree session (Claude Code)
+#   conduct --codex         ...using Codex instead
+#   conduct <city>          reattach to an existing worktree
+#   conduct list            list active worktrees
+#   conduct logs <city>     tail a worktree's dev-server log
+#   conduct stop <city>     stop a worktree's dev server
+#   conduct finish [city]   push branch + open a PR (gh)
+#   conduct rm <city>       archive: stop server, remove worktree + branch
+#   conduct --config        edit this repo's .conduct.conf
+#   conduct help            show help
+#
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+# Resolve this script's own directory, following symlinks (so program assets
+# like cities.txt are found whether conduct is run in place, via a symlink in
+# ~/.local/bin, or from a Homebrew Cellar prefix).
+SELF="${BASH_SOURCE[0]}"
+while [[ -h "$SELF" ]]; do
+  _dir="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$_dir/$SELF"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+
+# CONDUCT_HOME = the runtime DATA dir (worktrees, logs, state). Default ~/conduct.
+CONDUCT_HOME="${CONDUCT_HOME:-$HOME/conduct}"
+WORKTREES_DIR="$CONDUCT_HOME/worktrees"
+LOGS_DIR="$CONDUCT_HOME/logs"
+STATE_DIR="$CONDUCT_HOME/state"
+
+# cities.txt is a program ASSET: look next to the script first, then in the
+# data dir, then allow an explicit override.
+CITIES_FILE="${CONDUCT_CITIES:-}"
+if [[ -z "$CITIES_FILE" ]]; then
+  if [[ -f "$SCRIPT_DIR/cities.txt" ]]; then CITIES_FILE="$SCRIPT_DIR/cities.txt"
+  else CITIES_FILE="$CONDUCT_HOME/cities.txt"; fi
+fi
+
+CONFIG_NAME=".conduct.conf"
+BASE_PORT="${CONDUCT_BASE_PORT:-3000}"
+PORT_STRIDE=10
+
+# ---------------------------------------------------------------------------
+# Pretty output
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'
+  YLW=$'\033[33m'; BLU=$'\033[34m'; RST=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; RST=""
+fi
+info()  { printf '%s→%s %s\n' "$BLU" "$RST" "$*"; }
+ok()    { printf '%s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn()  { printf '%s!%s %s\n' "$YLW" "$RST" "$*" >&2; }
+die()   { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Repo context (resolved when we're inside a git repo)
+# ---------------------------------------------------------------------------
+REPO_PATH=""; REPO_NAME=""; DEFAULT_BRANCH=""
+
+resolve_repo() {
+  REPO_PATH="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || die "not inside a git repository (cd into a project first)"
+  REPO_NAME="$(basename "$REPO_PATH")"
+  DEFAULT_BRANCH="$(default_branch)"
+}
+
+default_branch() {
+  local ref
+  ref="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"
+  if [[ -n "$ref" ]]; then
+    echo "${ref##*/}"; return
+  fi
+  if git show-ref --verify --quiet refs/remotes/origin/main; then echo main; return; fi
+  if git show-ref --verify --quiet refs/remotes/origin/master; then echo master; return; fi
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main
+}
+
+has_remote() { git remote get-url origin >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Config (.conduct.conf in the repo root)
+# ---------------------------------------------------------------------------
+CONDUCT_SETUP=""; CONDUCT_RUN=""; CONDUCT_ARCHIVE=""; CONDUCT_COPY_FILES=""
+
+config_path() { echo "$REPO_PATH/$CONFIG_NAME"; }
+
+load_config() {
+  local cfg; cfg="$(config_path)"
+  [[ -f "$cfg" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$cfg"
+  return 0
+}
+
+detect_pm() {
+  if [[ -f "$REPO_PATH/pnpm-lock.yaml" ]]; then echo pnpm
+  elif [[ -f "$REPO_PATH/yarn.lock" ]]; then echo yarn
+  elif [[ -f "$REPO_PATH/bun.lockb" ]]; then echo bun
+  else echo npm; fi
+}
+
+default_setup_for() {
+  case "$1" in
+    pnpm) echo "pnpm install" ;;
+    yarn) echo "yarn install" ;;
+    bun)  echo "bun install" ;;
+    *)    echo "npm install" ;;
+  esac
+}
+
+default_run_for() {
+  case "$1" in
+    pnpm) echo 'pnpm dev --port $CONDUCT_PORT' ;;
+    yarn) echo 'yarn dev --port $CONDUCT_PORT' ;;
+    bun)  echo 'bun run dev --port $CONDUCT_PORT' ;;
+    *)    echo 'npm run dev -- --port $CONDUCT_PORT' ;;
+  esac
+}
+
+# Write the config file. Args are passed via the CONDUCT_* globals.
+write_config() {
+  local cfg; cfg="$(config_path)"
+  {
+    echo "# conduct per-repo config (see: conduct help)"
+    echo "# Commands run via 'bash -c'; \$CONDUCT_PORT et al. are set at run time."
+    echo "# Available: \$CONDUCT_PORT \$CONDUCT_WORKTREE_PATH \$CONDUCT_REPO_PATH \$CONDUCT_WORKTREE_NAME"
+    echo ""
+    printf "CONDUCT_SETUP='%s'\n"      "${CONDUCT_SETUP//\'/\'\\\'\'}"
+    printf "CONDUCT_RUN='%s'\n"        "${CONDUCT_RUN//\'/\'\\\'\'}"
+    printf "CONDUCT_ARCHIVE='%s'\n"    "${CONDUCT_ARCHIVE//\'/\'\\\'\'}"
+    printf "CONDUCT_COPY_FILES='%s'\n" "${CONDUCT_COPY_FILES//\'/\'\\\'\'}"
+  } > "$cfg"
+  ok "wrote $cfg"
+}
+
+first_run_prompt() {
+  local pm; pm="$(detect_pm)"
+  printf '\n%sNo %s found for %s%s — let'\''s create one.%s\n' \
+    "$BOLD" "$CONFIG_NAME" "$REPO_NAME" "$RST" "$RST"
+  printf '%sDetected package manager: %s%s\n' "$DIM" "$pm" "$RST"
+
+  local ans
+  printf '\nUse %s defaults? [Y/n] ' "$pm"
+  read -r ans
+  if [[ -z "$ans" || "$ans" =~ ^[Yy] ]]; then
+    CONDUCT_SETUP="$(default_setup_for "$pm")"
+    CONDUCT_RUN="$(default_run_for "$pm")"
+    CONDUCT_ARCHIVE=""
+  else
+    printf 'setup command   (install deps): '; read -r CONDUCT_SETUP
+    printf 'run command     (dev server)  : '; read -r CONDUCT_RUN
+    printf 'archive command (cleanup, opt): '; read -r CONDUCT_ARCHIVE
+  fi
+
+  printf 'files to copy from the main repo [.env .env.local]: '
+  read -r CONDUCT_COPY_FILES
+  [[ -z "$CONDUCT_COPY_FILES" ]] && CONDUCT_COPY_FILES=".env .env.local"
+
+  write_config
+  printf '%sTip: edit anytime with `conduct --config`%s\n\n' "$DIM" "$RST"
+}
+
+# ---------------------------------------------------------------------------
+# State files: $STATE_DIR/<repo>/<city>.env  (sourced; vars prefixed ST_)
+# ---------------------------------------------------------------------------
+repo_state_dir() { echo "$STATE_DIR/$REPO_NAME"; }
+
+state_file_for() { echo "$STATE_DIR/$1/$2.env"; }   # repo, city
+
+write_state() { # city
+  local city="$1" dir; dir="$(repo_state_dir)"
+  mkdir -p "$dir"
+  {
+    printf "ST_REPO='%s'\n"      "$REPO_NAME"
+    printf "ST_CITY='%s'\n"      "$city"
+    printf "ST_BRANCH='%s'\n"    "$ST_BRANCH"
+    printf "ST_WORKTREE='%s'\n"  "$ST_WORKTREE"
+    printf "ST_REPO_PATH='%s'\n" "$REPO_PATH"
+    printf "ST_PORT='%s'\n"      "$ST_PORT"
+    printf "ST_PID='%s'\n"       "${ST_PID:-}"
+    printf "ST_AGENT='%s'\n"     "${ST_AGENT:-claude}"
+    printf "ST_CREATED='%s'\n"   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$dir/$city.env"
+}
+
+# Load a state file by city. Searches the current repo first (if any), then all
+# repos. On success, ST_* globals are populated and ST_STATE_FILE is set.
+ST_STATE_FILE=""
+load_state() { # city
+  local city="$1" f
+  ST_STATE_FILE=""
+  if [[ -n "$REPO_NAME" ]]; then
+    f="$(state_file_for "$REPO_NAME" "$city")"
+    if [[ -f "$f" ]]; then source "$f"; ST_STATE_FILE="$f"; return 0; fi
+  fi
+  for f in "$STATE_DIR"/*/"$city.env"; do
+    [[ -f "$f" ]] || continue
+    source "$f"; ST_STATE_FILE="$f"; return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Ports
+# ---------------------------------------------------------------------------
+port_in_use() { # port
+  local p="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+  # fall back to a /dev/tcp probe
+  (exec 3<>"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1 && { exec 3>&- 3<&-; return 0; }
+  return 1
+}
+
+ports_reserved() { # echoes every ST_PORT recorded in state
+  local f
+  for f in "$STATE_DIR"/*/*.env; do
+    [[ -f "$f" ]] || continue
+    # shellcheck disable=SC1090
+    ( source "$f"; echo "${ST_PORT:-}" )
+  done
+}
+
+alloc_port() {
+  local reserved; reserved="$(ports_reserved | tr '\n' ' ')"
+  local p="$BASE_PORT"
+  while :; do
+    case " $reserved " in *" $p "*) p=$((p + PORT_STRIDE)); continue;; esac
+    if port_in_use "$p"; then p=$((p + PORT_STRIDE)); continue; fi
+    echo "$p"; return 0
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Cities
+# ---------------------------------------------------------------------------
+used_cities() { # echoes cities already used in this repo
+  local f
+  for f in "$(repo_state_dir)"/*.env; do
+    [[ -f "$f" ]] || continue
+    basename "$f" .env
+  done
+}
+
+pick_city() {
+  local used; used="$(used_cities | tr '\n' ' ')"
+  local -a pool=(); local c
+  while IFS= read -r c; do
+    [[ -z "$c" ]] && continue
+    case " $used " in *" $c "*) continue;; esac
+    pool+=("$c")
+  done < "$CITIES_FILE"
+
+  if [[ ${#pool[@]} -gt 0 ]]; then
+    echo "${pool[$((RANDOM % ${#pool[@]}))]}"
+    return
+  fi
+  # exhausted: take any city and add a numeric suffix until free
+  local base n=2
+  base="$(sed -n "$(( (RANDOM % $(wc -l < "$CITIES_FILE")) + 1 ))p" "$CITIES_FILE")"
+  while [[ -f "$(state_file_for "$REPO_NAME" "$base-$n")" ]]; do n=$((n + 1)); done
+  echo "$base-$n"
+}
+
+# ---------------------------------------------------------------------------
+# Process control
+# ---------------------------------------------------------------------------
+server_up() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+
+kill_tree() { # pid
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$child"; done
+  kill "$pid" 2>/dev/null || true
+}
+
+stop_server() { # pid port
+  local pid="${1:-}" port="${2:-}"
+  [[ -n "$pid" ]] && kill_tree "$pid"
+  # belt and suspenders: free the port
+  if [[ -n "$port" ]] && command -v lsof >/dev/null 2>&1; then
+    local stragglers; stragglers="$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null)"
+    [[ -n "$stragglers" ]] && kill $stragglers 2>/dev/null || true
+  fi
+}
+
+start_server() { # city  (expects ST_* set; sets ST_PID)
+  local city="$1" log
+  log="$LOGS_DIR/$REPO_NAME/$city/dev.log"
+  mkdir -p "$(dirname "$log")"
+  if [[ -z "${CONDUCT_RUN:-}" ]]; then
+    warn "no run command configured; skipping dev server"
+    ST_PID=""
+    return 0
+  fi
+  # Launch in a subshell and echo the backgrounded pid out via command
+  # substitution. nohup keeps it alive after the subshell exits.
+  ST_PID="$(
+    cd "$ST_WORKTREE" || exit
+    export CONDUCT_PORT="$ST_PORT" PORT="$ST_PORT" \
+           CONDUCT_WORKTREE_PATH="$ST_WORKTREE" CONDUCT_REPO_PATH="$ST_REPO_PATH" \
+           CONDUCT_WORKTREE_NAME="$city"
+    nohup bash -c "$CONDUCT_RUN" >"$log" 2>&1 &
+    echo "$!"
+  )"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+AGENT="claude"
+
+launch_agent() { # city  (cd into worktree, run agent in foreground)
+  local city="$1"
+  if ! command -v "$AGENT" >/dev/null 2>&1; then
+    warn "'$AGENT' not found on PATH — open the worktree yourself:"
+    echo "    cd $ST_WORKTREE"
+    return
+  fi
+  info "launching $AGENT in ${BOLD}$REPO_NAME/$city${RST}  (exit to manage this worktree)"
+  ( cd "$ST_WORKTREE" && "$AGENT" ) || true
+}
+
+cmd_new() {
+  resolve_repo
+  load_config || first_run_prompt
+  load_config || die "could not load config"
+
+  if has_remote; then
+    info "fetching origin…"
+    git fetch origin --quiet || warn "git fetch failed; continuing with local refs"
+  else
+    warn "no 'origin' remote; basing worktree on local HEAD"
+  fi
+
+  local city; city="$(pick_city)"
+  local branch="conduct/$city"
+  local wt="$WORKTREES_DIR/$REPO_NAME/$city"
+  mkdir -p "$(dirname "$wt")"
+
+  local base
+  if has_remote && git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+    base="origin/$DEFAULT_BRANCH"
+  else
+    base="HEAD"
+  fi
+
+  info "creating worktree ${BOLD}$city${RST} (branch $branch from $base)"
+  git worktree add -b "$branch" "$wt" "$base" >/dev/null \
+    || die "git worktree add failed"
+
+  ST_BRANCH="$branch"; ST_WORKTREE="$wt"; ST_AGENT="$AGENT"
+  ST_PORT="$(alloc_port)"; ST_REPO_PATH="$REPO_PATH"; ST_PID=""
+  # Reserve the port in state immediately (before the slow setup) so a
+  # concurrent `conduct` can't grab the same one.
+  write_state "$city"
+
+  # copy untracked files from the source repo
+  if [[ -n "${CONDUCT_COPY_FILES:-}" ]]; then
+    local f
+    for f in $CONDUCT_COPY_FILES; do
+      if [[ -e "$REPO_PATH/$f" && ! -e "$wt/$f" ]]; then
+        cp -R "$REPO_PATH/$f" "$wt/$f" && info "copied $f"
+      fi
+    done
+  fi
+
+  # setup (blocking)
+  if [[ -n "${CONDUCT_SETUP:-}" ]]; then
+    info "running setup: ${DIM}$CONDUCT_SETUP${RST}"
+    ( cd "$wt" \
+        && CONDUCT_PORT="$ST_PORT" PORT="$ST_PORT" \
+           CONDUCT_WORKTREE_PATH="$wt" CONDUCT_REPO_PATH="$REPO_PATH" \
+           CONDUCT_WORKTREE_NAME="$city" \
+           bash -c "$CONDUCT_SETUP" ) || warn "setup exited non-zero"
+  fi
+
+  # run (background)
+  start_server "$city"
+  write_state "$city"
+
+  echo
+  ok "worktree ${BOLD}$REPO_NAME/$city${RST} ready"
+  printf '   branch    %s\n' "$branch"
+  printf '   port      %s  →  %shttp://localhost:%s%s\n' "$ST_PORT" "$BLU" "$ST_PORT" "$RST"
+  printf '   worktree  %s\n' "$wt"
+  printf '   logs      conduct logs %s\n' "$city"
+  if server_up "${ST_PID:-}"; then
+    printf '   server    %sup%s (pid %s)\n' "$GRN" "$RST" "$ST_PID"
+  else
+    printf '   server    %snot running%s — see logs\n' "$YLW" "$RST"
+  fi
+  echo
+
+  launch_agent "$city"
+  teardown_menu "$city"
+}
+
+cmd_attach() { # city
+  local city="${1:-}"
+  [[ -n "$city" ]] || die "usage: conduct attach <city>"
+  load_state "$city" || die "no worktree named '$city' (see: conduct list)"
+  REPO_NAME="$ST_REPO"; REPO_PATH="$ST_REPO_PATH"
+
+  # reload that repo's config so we can (re)start the server
+  CONDUCT_RUN=""; [[ -f "$ST_REPO_PATH/$CONFIG_NAME" ]] && source "$ST_REPO_PATH/$CONFIG_NAME"
+
+  if server_up "${ST_PID:-}"; then
+    info "server already up on :$ST_PORT (pid $ST_PID)"
+  else
+    info "server not running — restarting on :$ST_PORT"
+    start_server "$city"
+    write_state "$city"
+  fi
+  echo "   →  http://localhost:$ST_PORT"
+  echo
+  launch_agent "$city"
+  teardown_menu "$city"
+}
+
+cmd_list() {
+  local f shown=0
+  printf '%s%-14s %-12s %-22s %-6s %-10s%s\n' "$BOLD" "REPO" "CITY" "BRANCH" "PORT" "SERVER" "$RST"
+  for f in "$STATE_DIR"/*/*.env; do
+    [[ -f "$f" ]] || continue
+    ( source "$f"
+      if server_up "${ST_PID:-}"; then status="${GRN}up${RST} (${ST_PID})"; else status="${DIM}down${RST}"; fi
+      printf '%-14s %-12s %-22s %-6s %b\n' \
+        "$ST_REPO" "$ST_CITY" "$ST_BRANCH" "$ST_PORT" "$status" )
+    shown=1
+  done
+  [[ "$shown" -eq 0 ]] && printf '%s(no active worktrees)%s\n' "$DIM" "$RST"
+}
+
+cmd_logs() { # city
+  local city="${1:-}"
+  [[ -n "$city" ]] || die "usage: conduct logs <city>"
+  load_state "$city" || die "no worktree named '$city'"
+  local log="$LOGS_DIR/$ST_REPO/$city/dev.log"
+  [[ -f "$log" ]] || die "no log at $log"
+  info "tailing $log  (Ctrl-C to stop)"
+  tail -f "$log"
+}
+
+cmd_stop() { # city
+  local city="${1:-}"
+  [[ -n "$city" ]] || die "usage: conduct stop <city>"
+  load_state "$city" || die "no worktree named '$city'"
+  stop_server "${ST_PID:-}" "${ST_PORT:-}"
+  ST_PID=""; REPO_NAME="$ST_REPO"; REPO_PATH="$ST_REPO_PATH"
+  write_state "$city"
+  ok "stopped dev server for $ST_REPO/$city"
+}
+
+cmd_finish() { # [city]
+  local city="${1:-}"
+  if [[ -z "$city" ]]; then
+    # infer from cwd if we're inside a managed worktree
+    local top; top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    case "$top" in "$WORKTREES_DIR"/*) city="$(basename "$top")";; esac
+  fi
+  [[ -n "$city" ]] || die "usage: conduct finish <city>"
+  load_state "$city" || die "no worktree named '$city'"
+  command -v gh >/dev/null 2>&1 || die "GitHub CLI ('gh') not found"
+  info "pushing $ST_BRANCH and opening a PR…"
+  ( cd "$ST_WORKTREE" \
+      && git push -u origin "$ST_BRANCH" \
+      && gh pr create --fill --head "$ST_BRANCH" ) \
+    || die "failed to create PR"
+  ok "PR opened for $ST_REPO/$city"
+}
+
+cmd_rm() { # city
+  local city="${1:-}"
+  [[ -n "$city" ]] || die "usage: conduct rm <city>"
+  load_state "$city" || die "no worktree named '$city'"
+  REPO_NAME="$ST_REPO"; REPO_PATH="$ST_REPO_PATH"
+
+  local dirty; dirty="$(git -C "$ST_WORKTREE" status --porcelain 2>/dev/null)"
+  if [[ -n "$dirty" ]]; then
+    warn "worktree $ST_REPO/$city has uncommitted changes:"
+    git -C "$ST_WORKTREE" status --short
+  fi
+  printf 'Remove worktree + branch %s%s%s? [y/N] ' "$BOLD" "$city" "$RST"
+  local ans; read -r ans
+  [[ "$ans" =~ ^[Yy] ]] || { info "aborted"; return; }
+
+  # archive hook
+  CONDUCT_ARCHIVE=""; [[ -f "$ST_REPO_PATH/$CONFIG_NAME" ]] && source "$ST_REPO_PATH/$CONFIG_NAME"
+  if [[ -n "${CONDUCT_ARCHIVE:-}" ]]; then
+    info "running archive hook"
+    ( cd "$ST_WORKTREE" \
+        && CONDUCT_PORT="$ST_PORT" PORT="$ST_PORT" \
+           CONDUCT_WORKTREE_PATH="$ST_WORKTREE" CONDUCT_REPO_PATH="$ST_REPO_PATH" \
+           CONDUCT_WORKTREE_NAME="$city" \
+           bash -c "$CONDUCT_ARCHIVE" ) || warn "archive hook exited non-zero"
+  fi
+
+  stop_server "${ST_PID:-}" "${ST_PORT:-}"
+  git -C "$ST_REPO_PATH" worktree remove --force "$ST_WORKTREE" 2>/dev/null \
+    || warn "could not remove worktree dir (already gone?)"
+  git -C "$ST_REPO_PATH" worktree prune 2>/dev/null || true
+  git -C "$ST_REPO_PATH" branch -D "$ST_BRANCH" 2>/dev/null \
+    || warn "could not delete branch $ST_BRANCH"
+  rm -f "$ST_STATE_FILE"
+  rm -rf "$LOGS_DIR/$ST_REPO/$city"
+  # tidy now-empty per-repo parent dirs
+  rmdir "$STATE_DIR/$ST_REPO" "$LOGS_DIR/$ST_REPO" "$WORKTREES_DIR/$ST_REPO" 2>/dev/null || true
+  ok "removed $ST_REPO/$city"
+}
+
+cmd_config() {
+  resolve_repo
+  load_config || first_run_prompt
+  "${EDITOR:-vi}" "$(config_path)"
+}
+
+teardown_menu() { # city  (ST_* are populated)
+  echo
+  local srv
+  if server_up "${ST_PID:-}"; then srv="${GRN}server up on :$ST_PORT${RST}"; else srv="${DIM}server stopped${RST}"; fi
+  printf '%sAgent exited — %s/%s%s  (%b)\n' "$BOLD" "$REPO_NAME" "$1" "$RST" "$srv"
+  printf '  [k] keep running   (reattach: conduct %s)\n' "$1"
+  printf '  [s] stop server, keep worktree\n'
+  printf '  [p] create PR (gh) and keep worktree\n'
+  printf '  [r] remove worktree + branch\n'
+  printf '  [q] quit, change nothing\n'
+  printf 'choice [k]: '
+  local choice; read -r choice
+  case "${choice:-k}" in
+    s|S) cmd_stop "$1" ;;
+    p|P) cmd_finish "$1" ;;
+    r|R) cmd_rm "$1" ;;
+    q|Q) : ;;
+    *)   info "left running — reattach with: conduct $1" ;;
+  esac
+}
+
+cmd_help() {
+  cat <<EOF
+${BOLD}conduct${RST} — run Claude Code / Codex in isolated git worktrees, Conductor-style.
+
+${BOLD}USAGE${RST}
+  conduct [--codex] [city]   start a new worktree session, or reattach to <city>
+  conduct list | ls          list active worktrees
+  conduct logs <city>        tail a worktree's dev-server log
+  conduct stop <city>        stop a worktree's dev server (keep the worktree)
+  conduct finish [city]      push branch + open a PR with 'gh'
+  conduct rm <city>          stop server, remove worktree + branch (archive hook)
+  conduct --config           edit this repo's ${CONFIG_NAME}
+  conduct help               this help
+
+${BOLD}FLAGS${RST}
+  --codex                    launch Codex instead of Claude Code
+
+${BOLD}CONFIG${RST} (${CONFIG_NAME} in the repo root, created on first run)
+  CONDUCT_SETUP       install command, runs once in the new worktree
+  CONDUCT_RUN         dev-server command (use \$CONDUCT_PORT for the port)
+  CONDUCT_ARCHIVE     cleanup command, runs on 'conduct rm'
+  CONDUCT_COPY_FILES  space-separated untracked files to copy from the main repo
+
+${BOLD}ENV exposed to those commands${RST}
+  \$CONDUCT_PORT \$CONDUCT_WORKTREE_PATH \$CONDUCT_REPO_PATH \$CONDUCT_WORKTREE_NAME
+  (\$PORT is also set to \$CONDUCT_PORT)
+
+Worktrees:  $WORKTREES_DIR/<repo>/<city>
+Logs:       $LOGS_DIR/<repo>/<city>/dev.log
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+main() {
+  [[ -f "$CITIES_FILE" ]] || die "missing $CITIES_FILE (reinstall conduct)"
+  mkdir -p "$WORKTREES_DIR" "$LOGS_DIR" "$STATE_DIR"
+
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --codex)  AGENT="codex" ;;
+      --claude) AGENT="claude" ;;
+      --config) cmd_config; return ;;
+      -h|--help) cmd_help; return ;;
+      --) shift; while [[ $# -gt 0 ]]; do pos+=("$1"); shift; done; break ;;
+      -*) die "unknown flag: $1" ;;
+      *)  pos+=("$1") ;;
+    esac
+    shift
+  done
+
+  local cmd="${pos[0]:-}"
+  case "$cmd" in
+    "")            cmd_new ;;
+    list|ls)       cmd_list ;;
+    logs)          cmd_logs "${pos[1]:-}" ;;
+    stop)          cmd_stop "${pos[1]:-}" ;;
+    finish|pr)     cmd_finish "${pos[1]:-}" ;;
+    rm|remove)     cmd_rm "${pos[1]:-}" ;;
+    attach)        cmd_attach "${pos[1]:-}" ;;
+    help)          cmd_help ;;
+    *)
+      # bare name → reattach if it's a known worktree
+      if load_state "$cmd"; then
+        cmd_attach "$cmd"
+      else
+        die "unknown command or worktree: '$cmd' (try: conduct help)"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
