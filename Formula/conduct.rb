@@ -12,7 +12,7 @@ class Conduct < Formula
   desc "Run Claude Code or Codex in parallel git worktrees from the terminal"
   homepage "https://github.com/diego-segura/conduct"
   url "https://github.com/diego-segura/conduct/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "c49cf1ca1246fbb9aa369c36152082c7c231b75c92c93b28f312ea79897b0f21"
   license "MIT"
 
   # conduct shells out to git; on macOS the system git is fine, on Linux brew git.
