@@ -15,7 +15,7 @@ VERSION="0.1.0"
 TAP="local/conduct"                 # tap repo: homebrew-conduct under user "local"
 FORMULA="local/conduct/conduct"
 SRC="$HOME/conduct"
-PROD_FORMULA="$SRC/homebrew/conduct.rb"
+PROD_FORMULA="$SRC/Formula/conduct.rb"
 TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-conduct"
 
 PASS=0; FAIL=0

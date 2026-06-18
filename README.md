@@ -30,7 +30,7 @@ the agent exits, `conduct` offers a teardown menu (keep / stop / open PR / remov
 - [Directory layout](#directory-layout)
 - [Requirements](#requirements)
 - [Troubleshooting](#troubleshooting)
-- [Distribution via Homebrew (future)](#distribution-via-homebrew-future)
+- [Distribution via Homebrew](#distribution-via-homebrew)
 - [Limitations & notes](#limitations--notes)
 
 ---
@@ -56,9 +56,21 @@ Each session is one worktree = one branch = one task = (eventually) one PR.
 
 ## Install
 
-From this folder:
+### Homebrew
 
 ```sh
+brew tap diego-segura/conduct https://github.com/diego-segura/conduct
+brew install conduct
+```
+
+This repo is its own tap, so the `tap` line takes the explicit URL. On recent Homebrew
+you may also need `brew trust diego-segura/conduct`. Upgrade later with
+`brew upgrade conduct`.
+
+### From source
+
+```sh
+git clone https://github.com/diego-segura/conduct ~/conduct
 bash ~/conduct/install.sh
 ```
 
@@ -220,63 +232,23 @@ Works on macOS's default `bash` 3.2 and on modern `bash`.
 - **Stale entry in `conduct list`** — if a worktree dir was deleted by hand, run
   `conduct rm <city>` to clear its state, then `git worktree prune` in the main repo.
 
-## Distribution via Homebrew (future)
+## Distribution via Homebrew
 
-This is a notes-to-self section for packaging `conduct` so others can
-`brew install` it. It is **not set up yet** — it requires pushing the repo to GitHub
-first.
+`conduct` ships as **its own Homebrew tap** — the formula lives at
+[`Formula/conduct.rb`](Formula/conduct.rb) in this repo, so there's no separate
+`homebrew-conduct` repo to maintain. Install:
 
-**The model: a "tap" + a formula.** Homebrew installs from *formulae* (Ruby files). For
-a personal project you publish them in your own **tap** — a public GitHub repo named
-`homebrew-<name>` (the `homebrew-` prefix is mandatory and dropped in commands).
+```sh
+brew tap diego-segura/conduct https://github.com/diego-segura/conduct
+brew install conduct
+```
 
-**Steps:**
-
-1. **Push `conduct` to GitHub**, e.g. `github.com/<you>/conduct`, and cut a tagged
-   release (e.g. `v0.1.0`). Homebrew installs from a release tarball + its SHA-256:
-   ```sh
-   curl -L https://github.com/<you>/conduct/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
-   ```
-2. **Create the tap repo** `github.com/<you>/homebrew-conduct` with a `Formula/`
-   directory.
-3. **Write the formula** `Formula/conduct.rb`. Because `conduct` is a script (not a
-   compiled program), `install` just copies files into the Cellar. Install `conduct`
-   into `libexec` alongside `cities.txt` so the script's self-relative asset lookup
-   works, then symlink the executable into `bin`:
-   ```ruby
-   class Conduct < Formula
-     desc "Run Claude Code / Codex in parallel git worktrees from the terminal"
-     homepage "https://github.com/<you>/conduct"
-     url "https://github.com/<you>/conduct/archive/refs/tags/v0.1.0.tar.gz"
-     sha256 "<paste-the-sha-from-step-1>"
-     license "MIT"
-
-     def install
-       libexec.install "conduct", "cities.txt"
-       bin.install_symlink libexec/"conduct"
-     end
-
-     test do
-       assert_match "conduct", shell_output("#{bin}/conduct help")
-     end
-   end
-   ```
-   This works precisely because the script resolves `cities.txt` next to itself
-   (`SCRIPT_DIR/cities.txt`) while keeping `CONDUCT_HOME` (worktrees/logs/state) in the
-   user's home — program assets and user data stay cleanly separated.
-4. **Users install with:**
-   ```sh
-   brew tap <you>/conduct
-   brew install conduct
-   # or in one line:
-   brew install <you>/conduct/conduct
-   ```
-5. **Updates:** bump `url`/`sha256` (and `version` if needed) in the formula on each new
-   release tag; users get it via `brew upgrade`.
-
-**Optional later:** add a `bin/conduct` wrapper, a man page (`man.install`), or shell
-completions; submit to `homebrew-core` only if it gets popular (it has stricter rules —
-notability, no HEAD-only, must be stable). A personal tap is the right home for now.
+For the maintainer workflow (cutting releases, computing the `sha256`) and how to
+test the formula locally before tagging, see [`homebrew/README.md`](homebrew/README.md).
+The formula installs `conduct` + `cities.txt` into `libexec` and symlinks the script
+into `bin`; this works precisely because the script resolves `cities.txt` relative to
+its own path, while `CONDUCT_HOME` (worktrees/logs/state) stays in your home dir —
+program assets and user data stay cleanly separated.
 
 ## Limitations & notes
 

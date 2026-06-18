@@ -1,13 +1,13 @@
 # Homebrew formula for `conduct`.
 #
-# This is the PRODUCTION formula, meant to live in a tap repo named
-# `homebrew-conduct` at Formula/conduct.rb. Before it works you must:
-#   1. Push conduct to GitHub and tag a release (e.g. v0.1.0).
-#   2. Replace diego-segura below.
-#   3. Replace the sha256 with the release tarball's checksum:
-#        curl -fsSL https://github.com/diego-segura/conduct/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
+# This repo is its own tap (no separate homebrew-conduct repo). Install with:
+#   brew tap diego-segura/conduct https://github.com/diego-segura/conduct
+#   brew install conduct
 #
-# See homebrew/README.md for the full publishing + local-testing workflow.
+# When cutting a new release: tag it, then update `url` + `sha256` here, e.g.
+#   curl -fsSL https://github.com/diego-segura/conduct/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
+#
+# See homebrew/README.md for the full release + local-testing workflow.
 class Conduct < Formula
   desc "Run Claude Code or Codex in parallel git worktrees from the terminal"
   homepage "https://github.com/diego-segura/conduct"

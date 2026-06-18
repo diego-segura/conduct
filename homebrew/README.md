@@ -1,66 +1,60 @@
 # Distributing `conduct` with Homebrew
 
-Homebrew installs software from **formulae** (Ruby files). For a personal project you
-publish them in your own **tap** — a public GitHub repo named `homebrew-<name>` (the
-`homebrew-` prefix is required and dropped in commands). `homebrew/conduct.rb` here is
-the production formula; copy it to `Formula/conduct.rb` in your tap repo.
+This repo is **its own Homebrew tap** — there is no separate `homebrew-conduct`
+repo. The formula lives at [`Formula/conduct.rb`](../Formula/conduct.rb), which is one
+of the directories Homebrew searches in a tap.
 
-## A. Publish for real
+## Install (for users)
 
-1. **Push `conduct` to GitHub**, e.g. `github.com/diego-segura/conduct`, and tag a release:
+```sh
+brew tap diego-segura/conduct https://github.com/diego-segura/conduct
+brew install conduct
+```
+
+The explicit URL is required on the `tap` line because the repo is named `conduct`
+rather than `homebrew-conduct` (the short `brew tap diego-segura/conduct` form only
+works for repos with the `homebrew-` prefix). After tapping, `brew upgrade` works
+normally. On recent Homebrew, users may also need to trust the tap:
+
+```sh
+brew trust --formula diego-segura/conduct/conduct   # or: brew trust diego-segura/conduct
+```
+
+> One-off alternative (no tap, no upgrade tracking):
+> `brew install https://raw.githubusercontent.com/diego-segura/conduct/main/Formula/conduct.rb`
+
+## Cutting a release (for the maintainer)
+
+A formula needs a stable tarball + checksum, so each release is just a git tag:
+
+1. **Tag and push:**
    ```sh
    git tag v0.1.0 && git push origin v0.1.0
    ```
-2. **Get the release tarball's checksum** (GitHub auto-generates the tarball):
+2. **Get the tarball checksum** (GitHub auto-generates the tarball for the tag):
    ```sh
    curl -fsSL https://github.com/diego-segura/conduct/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
    ```
-3. **Edit `conduct.rb`**: replace `diego-segura` (homepage + url) and paste the
-   `sha256` from step 2.
-4. **Create the tap repo** `github.com/diego-segura/homebrew-conduct`, put the formula at
-   `Formula/conduct.rb`, and push.
-5. **Users install with:**
-   ```sh
-   brew install diego-segura/conduct/conduct
-   # equivalently: brew tap diego-segura/conduct && brew install conduct
-   ```
-6. **Releasing updates:** tag a new version, recompute the sha256, bump `url`/`sha256`
-   in the tap's formula. Users get it via `brew upgrade`.
+3. **Update `Formula/conduct.rb`**: set `url` to the new tag and paste the `sha256`.
+   Commit + push to `main`. (Homebrew reads the formula from `main`, and downloads the
+   tagged tarball named in `url` — they don't have to be the same commit.)
 
-## B. Test locally before publishing
+Users get the update via `brew upgrade conduct`.
 
-You don't need GitHub to test — point the formula at a **local tarball** and install
-from a **local tap**. The repo ships a script that does the whole loop:
+## Test locally before tagging
+
+You don't need GitHub to validate the formula — point `url` at a **local `file://`
+tarball** and install from a **throwaway local tap**. The repo ships a script that does
+the whole loop against `Formula/conduct.rb`:
 
 ```sh
 bash ~/conduct/homebrew/test-install.sh
 ```
 
-It will:
-1. build `conduct-<version>.tar.gz` from the working tree (with the `conduct-<version>/`
-   prefix dir GitHub uses),
-2. compute its sha256,
-3. create a throwaway local tap and drop in a formula whose `url` is `file://…` with that sha,
-4. `brew install` it, then run `brew audit --strict`, `brew style`, and `brew test`,
-5. verify the installed binary (`conduct help`) and that it resolves `cities.txt` from the prefix,
-6. uninstall and remove the throwaway tap.
-
-This is exactly how Homebrew maintainers smoke-test a formula: a `file://` URL plus
-`brew audit`/`brew test`. Nothing is published, and your manual `~/.local/bin/conduct`
-install is left untouched (Homebrew installs into `$(brew --prefix)/bin`).
-
-## Tap trust (recent Homebrew)
-
-Homebrew now requires you to **trust** third-party taps before it will run their
-formulae. After `brew tap`, users may need:
-
-```sh
-brew trust --formula diego-segura/conduct/conduct      # trust just this formula
-# or:  brew trust diego-segura/conduct                  # trust the whole tap
-```
-
-(A locally created tap is auto-trusted, which is why the local test installs without a
-prompt.) Mention this in your tap's README so users aren't surprised.
+It builds a local tarball, generates a `file://` formula with the real sha, then runs
+`brew style`, `brew audit --strict`, `brew install`, and `brew test`, verifies the
+installed binary, and cleans up. Your manual `~/.local/bin/conduct` install is left
+untouched (Homebrew installs into `$(brew --prefix)/bin`).
 
 ## Notes
 
